@@ -1,0 +1,13 @@
+{
+  "name": "frontier-pacer",
+  "version": "0.4.0",
+  "description": "One line above the prompt: context tokens, session cost, active time, a prompt-cache countdown and your plan limits with pace",
+  "author": {
+    "name": "Noah Huang"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/n0ah37/frontier-pacer",
+  "repository": "https://github.com/n0ah37/frontier-pacer",
+  "privacyPolicyUrl": "https://github.com/n0ah37/frontier-pacer#what-it-runs-reads-and-sends",
+  "types": "./types/index.d.ts"
+}
