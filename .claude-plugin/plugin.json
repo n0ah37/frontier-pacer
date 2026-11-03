@@ -1,6 +1,6 @@
 {
   "name": "frontier-pacer",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "One line above the prompt: context tokens, session cost, active time, a prompt-cache countdown and your plan limits with pace",
   "author": {
     "name": "Noah Huang"

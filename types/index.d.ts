@@ -25,7 +25,7 @@ export type Shared = {
   strikes?: number
 }
 
-/** The session's figures, as `session.measure` pushes them. */
+/** The session's figures, as `session.measure` pushes them and `$.session.usage()` answers. */
 export type Meter = {
   /** Input tokens the last main-thread response was answered over; null before the first. */
   tokens: number | null
@@ -38,19 +38,43 @@ export type Meter = {
 
 /** When the main thread's cached prefix was last read, and for how long the API keeps it. */
 export type CacheMark = {
-  /** When the last main-thread request went out, in milliseconds since the epoch. */
+  /** When the last main-thread request (a turn's, or a compaction's) went out, in milliseconds since the epoch. */
   at: number
-  /** The lifetime the last response's cache write used; null until one is seen. */
+  /** The lifetime the session's cache writes use; null until a response or an environment variable says. */
   ttl: '5m' | '1h' | null
 }
 
 /**
- * Time the model spent working, as the desktop's usage panel counts it: the turns this Claude Code
- * process has run (from a prompt to the last thing the turn wrote), the running one included.
- * `doneMs` sums those the transcript holds; `closedMs` all but the last, which may still run;
- * `from` is when the process started, or null where it could not be read (then every turn counts).
+ * Time the model spent on the session's main-thread turns, as the engine times each turn (the
+ * desktop's usage panel sums the same lengths). Every process that runs the session adds to one
+ * total kept in the plugin's store under `active:<session id>`, so a paused and restarted session
+ * keeps counting where it stopped.
  */
-export type Active = { doneMs: number; closedMs: number; lastPromptAt: number | null; since: number | null; from: number | null }
+export type Active = {
+  /** The session the figures belong to; null until read, and again after /clear or /resume. */
+  sessionId: string | null
+  /** The turns finished before this load: the stored total, or the first time the transcript's; null until read. */
+  baseMs: number | null
+  /**
+   * Whether `baseMs` holds the session's earlier turns. False when the transcript could not be read
+   * whole: the total is then not stored, and the next process of the session reads it again.
+   */
+  hasHistory: boolean
+  /** The turns this load saw finish, at the lengths the engine reported. */
+  runMs: number
+  /** When the running main-thread turn began, as `turn.start` saw it; null between turns. */
+  since: number | null
+  /** When this load began counting: the transcript's turns are read up to here and no further. */
+  loadedAt: number
+}
+
+/** One session's total as the store keeps it. */
+export type StoredActive = {
+  /** Every finished main-thread turn's length, summed. */
+  ms: number
+  /** When it was last written, so totals of long-gone sessions can be dropped. */
+  at: number
+}
 
 declare module 'claude-code' {
   interface PluginState {
