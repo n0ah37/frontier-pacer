@@ -20,7 +20,7 @@ The desktop Code tab draws real rings; the terminal draws ○◔◑◕● glyphs
 
 ## Requirements
 
-Claude Code with mods (the `hooks/hooks.json` `modules` entry), on macOS or Linux. The Active time and the cache lifetime read the transcript with `sh`, `awk`, `tail` and `ps`; where those are missing, as on Windows without a POSIX shell, Active counts only turns seen since the mod loaded and the cache lifetime is inferred from your plan.
+Claude Code with mods (the `hooks/hooks.json` `modules` entry), on macOS or Linux. The Active time and the cache lifetime read the transcript with `sh`, `awk` and `tail`; where those are missing, as on Windows without a POSIX shell, Active counts only turns seen since the mod loaded and the cache lifetime is inferred from your plan.
 
 ## Install
 
@@ -42,7 +42,6 @@ Everything the mod touches, in full:
   - `/bin/sh -c` with a one-line loop that looks for `<session id>.jsonl` under `projects/` and prints its path, since the engine does not expose the transcript path;
   - `tail -c 1048576 <transcript>` to read the end of the transcript for the cache lifetime of the last response;
   - `awk` with a fixed program over the transcript that prints two lines per turn, the prompt's time and the time of the last work after it (`P <time>`, `A <time>`), for the Active time;
-  - `/bin/sh -c` with a one-line loop that walks up the parent processes with `ps -o comm=` and `ps -o etime=` until it finds `claude`, to learn when this Claude Code process started, so Active counts only turns run by this process, as the app's own usage panel does.
   The output of these programs is only parsed into numbers for the band. The mod never runs a command it receives from the network, the model or the conversation.
 - **Commands**: it adds `/pace`, which only hides or shows the band.
 - **Hooks**: it observes `session.start`, `session.measure`, `turn.start`, `turn.step`, `turn.complete`, `PostModelSwitch` and `session.end` and passes each one on unchanged with `next(e)`, so it alters no setting, instruction, prompt, tool or response. Its one drawing hook, `ui.render` on `AbovePrompt`, adds the band, and its `command.run` hook answers only `/pace`.

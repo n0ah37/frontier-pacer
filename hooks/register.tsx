@@ -68,6 +68,22 @@ const FIND_TRANSCRIPT =
 // session.start, so the first event after one starts them.
 let isRunning = false
 
+// On Vertex, Bedrock or Foundry there is no plan, so no 5h or 7d window to ask for or draw.
+let isCloud = false
+// Claude Code asks for the hour on Vertex, Bedrock and Foundry unless this forces five minutes.
+let isForced5m = false
+
+async function learnCloud($: EngineInterface): Promise<void> {
+  const flags = [
+    await $.env.get('CLAUDE_CODE_USE_VERTEX'),
+    await $.env.get('CLAUDE_CODE_USE_BEDROCK'),
+    await $.env.get('CLAUDE_CODE_USE_FOUNDRY'),
+  ]
+  const on = (v: string | undefined) => v !== undefined && v !== '' && v !== '0' && v.toLowerCase() !== 'false'
+  isCloud = flags.some(on)
+  isForced5m = on(await $.env.get('FORCE_PROMPT_CACHING_5M'))
+}
+
 function run($: EngineInterface): void {
   if (isRunning) {
     return
@@ -93,7 +109,7 @@ export const register: Register = on => {
     const m = toMeter(e.context, e.rateLimits, e.cost?.usd)
     await update($, meter, () => m)
     // A response landed (it cost something, or moved a window): its headers are the newest reading.
-    if (e.changed.includes('cost') || e.changed.includes('rateLimits')) {
+    if (!isCloud && (e.changed.includes('cost') || e.changed.includes('rateLimits'))) {
       const at = await $.clock.now()
       await share($, m.limits.map(limit => ({ ...limit, at, source: 'headers' as const })))
       void fetchUsage($)
@@ -242,7 +258,7 @@ export const register: Register = on => {
     }
 
     // The newest reading of each window; until any, the headers the engine held at load.
-    const limits = (held.length > 0 ? held : (m?.limits ?? [])).map(limit => current(limit, now))
+    const limits = isCloud ? [] : (held.length > 0 ? held : (m?.limits ?? [])).map(limit => current(limit, now))
     for (const limit of limits) {
       const lane = laneOf(limit.kind)
       // A week scoped to one model shows while the session runs that model.
@@ -323,6 +339,7 @@ async function pulse($: EngineInterface): Promise<void> {
 }
 
 async function boot($: EngineInterface): Promise<void> {
+  await learnCloud($)
   try {
     await $.command.register({ name: COMMAND, description: 'Hide or show the usage band (on, off)', argumentHint: '[on|off]', immediate: true })
   } catch {
@@ -338,10 +355,6 @@ async function boot($: EngineInterface): Promise<void> {
 
 const PROMPT_SLACK_MS = 5_000
 const EMPTY_ACTIVE: Active = { doneMs: 0, closedMs: 0, lastPromptAt: null, since: null, from: null }
-
-// Prints how long the Claude Code process above this one has run, as ps's elapsed time.
-const PROCESS_AGE =
-  'p=$PPID; while [ "$p" -gt 1 ]; do case "$(ps -o comm= -p "$p")" in *claude|*claude.exe) ps -o etime= -p "$p"; exit 0;; esac; p=$(ps -o ppid= -p "$p" | tr -d " "); done'
 
 // Prints each main-thread turn of the transcript as `P <time>` for the prompt the person sent and
 // `A <time>` for the last row of the model's work after it (a response, a tool result); the rest of
@@ -373,7 +386,9 @@ async function learnActive($: EngineInterface): Promise<void> {
       return
     }
 
-    const from = (await read($, active))?.from ?? (await processStart($))
+    // Every turn of the session counts, including those run by an earlier process: the app pauses
+    // idle sessions and starts a new process on the next prompt. Only /clear starts the count over.
+    const from = (await read($, active))?.from ?? null
     const { stdout } = await $.process.run(['awk', TURN_ROWS, path])
     const turns = turnsOf(stdout).filter(t => from === null || t.at >= from)
     const doneMs = turns.reduce((sum, t) => sum + t.ms, 0)
@@ -387,24 +402,6 @@ async function learnActive($: EngineInterface): Promise<void> {
     }))
   } catch {
     await update($, active, a => a ?? EMPTY_ACTIVE)
-  }
-}
-
-// When this Claude Code process started: the panel counts the turns since.
-async function processStart($: EngineInterface): Promise<number | null> {
-  try {
-    const { stdout } = await $.process.run(['/bin/sh', '-c', PROCESS_AGE])
-    const match = /^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/.exec(stdout)
-    if (match === null) {
-      return null
-    }
-
-    const [, days = '0', hours = '0', minutes = '0', seconds = '0'] = match
-    const ageMs = (((Number(days) * 24 + Number(hours)) * 60 + Number(minutes)) * 60 + Number(seconds)) * 1000
-
-    return (await $.clock.now()) - ageMs
-  } catch {
-    return null
   }
 }
 
@@ -574,6 +571,9 @@ async function adoptShared($: EngineInterface): Promise<Shared> {
 // Reads the windows /usage shows: the session, the week across models, Sonnet's week, and each week
 // scoped to one model. A failure keeps the last readings, which the next response's headers refresh.
 async function fetchUsage($: EngineInterface): Promise<void> {
+  if (isCloud) {
+    return
+  }
   try {
     const now = await $.clock.now()
     const shared = await adoptShared($)
@@ -711,6 +711,7 @@ async function transcriptPath($: EngineInterface): Promise<string | null> {
 
 function lastResponse(text: string): { at: number; ttl: Ttl | null } | null {
   const lines = text.split('\n')
+  let newest: { at: number; ttl: Ttl | null } | null = null
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]
     if (line === undefined || !line.includes('"assistant"')) {
@@ -742,10 +743,15 @@ function lastResponse(text: string): { at: number; ttl: Ttl | null } | null {
       continue
     }
 
-    return { at, ttl: ttlOf(entry.message.usage) }
+    // A response that only read the cache says nothing of its lifetime: look further back for one that wrote it.
+    const ttl = ttlOf(entry.message.usage)
+    newest = newest ?? { at, ttl }
+    if (ttl !== null) {
+      return { at: newest.at, ttl }
+    }
   }
 
-  return null
+  return newest
 }
 
 // The engine's own reading of a response's cache write.
@@ -764,6 +770,9 @@ function ttlOf(usage: unknown): Ttl | null {
 
 // Before any response says: subscribers get the hour unless they are past a limit, everyone else five minutes.
 function guessTtl(m: Meter | null): Ttl {
+  if (isCloud) {
+    return isForced5m ? '5m' : '1h'
+  }
   if (m === null || m.limits.length === 0) {
     return '5m'
   }

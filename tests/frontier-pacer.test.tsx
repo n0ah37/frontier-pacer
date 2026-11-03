@@ -53,7 +53,8 @@ function ran(stdout: string): ProcessRunResult {
 }
 
 // The engine beneath the mod: usage, the session id, and the host commands it runs.
-function host(on: On, transcript: { text: string; rows?: string }, usage: { body: unknown } = { body: USAGE_BODY }, model = 'claude-fable-5-1', stored: Record<string, unknown> = {}): void {
+function host(on: On, transcript: { text: string; rows?: string }, usage: { body: unknown } = { body: USAGE_BODY }, model = 'claude-fable-5-1', stored: Record<string, unknown> = {}, env: Record<string, string> = {}): void {
+  on('env.get', (_$, e) => ({ value: env[e.name] }))
   // The plugin's store, kept in `stored` itself so a test reads what the other sessions would.
   on('store.get', (_$, e) => ({ value: stored[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(stored[e.key])) }))
   on('store.set', (_$, e) => {
@@ -106,10 +107,6 @@ function host(on: On, transcript: { text: string; rows?: string }, usage: { body
     const [command] = e.argv
     if (command === 'awk') {
       return { value: ran(transcript.rows ?? '') }
-    }
-    if (command === '/bin/sh' && e.argv[2]?.includes('etime') === true) {
-      // The Claude Code process started 90 minutes ago.
-      return { value: ran('01:30:00\n') }
     }
     if (command === '/bin/sh') {
       return { value: ran('/Users/x/.claude/projects/-tmp/sess-1.jsonl\n') }
@@ -308,8 +305,8 @@ test('a session under half a dollar reads to four places, as /usage prints it', 
 test('active is the time the model worked: past turns from the transcript, then the live one', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const at = (minutes: number) => new Date(NOW + minutes * MIN).toISOString()
-  // A turn from before this process started (not counted), then two of its own: 10 minutes of work,
-  // then 7 minutes 6 seconds, with an idle half hour between.
+  // A turn run by an earlier process (the app paused the session in between), then two more:
+  // 50 minutes, 10 minutes and 7 minutes 6 seconds of work, all counted.
   const rows = [
     `P ${at(-200)}`, `A ${at(-150)}`,
     `P ${at(-80)}`, `A ${at(-79)}`, `A ${at(-70)}`,
@@ -321,25 +318,25 @@ test('active is the time the model worked: past turns from the transcript, then 
   await start($, clock)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect((await texts(ui)).join(' ')).toContain('active 17m 6s')
+  expect((await texts(ui)).join(' ')).toContain('active 1h 7m')
 
   // Idle time adds nothing.
   await clock.advance(30 * MIN)
   await ui.redraw()
-  expect((await texts(ui)).join(' ')).toContain('active 17m 6s')
+  expect((await texts(ui)).join(' ')).toContain('active 1h 7m')
 
   // A new turn counts live while it runs.
   await $.turn.start({ text: 'go', turnId: 't1' })
   await clock.advance(54_000)
   const working = await $.ui.mount({ ...BAND, props: { ...BAND.props, isWorking: true }, surface: 'terminal' })
-  expect((await texts(working)).join(' ')).toContain('active 18m 0s')
+  expect((await texts(working)).join(' ')).toContain('active 1h 8m')
 
   // At its end the transcript holds it.
   transcript.rows = `${rows}\nP ${at(30)}\nA ${at(30.9)}\n`
   await $.turn.complete({ reason: 'answer', answer: 'done', durationMs: 54_000, isAborted: false, turnId: 't1' })
   await clock.settle()
   await ui.redraw()
-  expect((await texts(ui)).join(' ')).toContain('active 18m 0s')
+  expect((await texts(ui)).join(' ')).toContain('active 1h 8m')
 })
 
 test('loaded mid-turn, the running turn counts from its prompt', async ($, on) => {
@@ -529,4 +526,50 @@ test('every session shows the newest reading any of them fetched', async ($, on)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect((await texts(ui)).join(' ')).toContain('5h ◕ 81%')
+})
+
+test('on Vertex the band keeps context, cost and cache but draws no plan windows and asks no endpoint', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // A reading another session shared from the subscription days must not show either.
+  const stored: Record<string, unknown> = {
+    readings: { readings: [{ kind: 'five_hour', percentUsed: 81, resetsAt: LIMITS[0]?.resetsAt ?? null, at: NOW - 2_000 }] },
+  }
+  host(on, { text: `${response(NOW - 10 * MIN, { ephemeral_1h_input_tokens: 2_510, ephemeral_5m_input_tokens: 0 })}\n` }, { body: USAGE_BODY }, 'claude-opus-5-5', stored, { CLAUDE_CODE_USE_VERTEX: '1' })
+  await start($, clock)
+  await clock.advance(2 * MIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  const line = (await texts(ui)).join(' ')
+
+  expect(line).toContain('ctx 143K $4.21 active')
+  expect(line).toContain('cache [ring]')
+  expect(line).not.toContain('5h')
+  expect(line).not.toContain('7d')
+  // The endpoint was never asked: asking claims a turn in the shared store first.
+  expect((stored.readings as { askedAt?: number }).askedAt).toBeUndefined()
+})
+
+test('on Vertex the cache timer counts the hour before any response says, not five minutes', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  host(on, { text: '' }, { body: USAGE_BODY }, 'claude-opus-5-5', {}, { CLAUDE_CODE_USE_VERTEX: '1' })
+  await start($, clock)
+  await step($)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await texts(ui)).join(' ')).toContain('60:00')
+})
+
+test('a response that only read the cache keeps the lifetime of the last one that wrote it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const readOnly = JSON.stringify({
+    type: 'assistant', isSidechain: false, timestamp: new Date(NOW - 2 * MIN).toISOString(),
+    message: { model: 'claude-opus-5-5', usage: { input_tokens: 2, cache_read_input_tokens: 140_000, cache_creation_input_tokens: 0, cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 0 } } },
+  })
+  host(on, { text: `${response(NOW - 10 * MIN, { ephemeral_1h_input_tokens: 2_510, ephemeral_5m_input_tokens: 0 })}\n${readOnly}\n` }, { body: USAGE_BODY }, 'claude-opus-5-5', {}, { CLAUDE_CODE_USE_VERTEX: '1' })
+  await start($, clock)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  // Read two minutes ago, an hour's lifetime: 58 minutes left.
+  expect((await texts(ui)).join(' ')).toContain('58:00')
 })
