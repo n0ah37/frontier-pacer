@@ -7,7 +7,7 @@ import type {
   SessionRateLimit,
 } from 'claude-code'
 
-import type { Active, Limit, Meter, Reading, Shared } from '../types'
+import type { Active, Limit, Meter, Reading, Shared, StoredActive } from '../types'
 
 const meter = atom({ plugin: 'frontier-pacer', key: 'meter' } as const, null)
 const cache = atom({ plugin: 'frontier-pacer', key: 'cache' } as const, null)
@@ -51,6 +51,9 @@ const RED = '#FF3B30'
 const GREEN = '#34C759'
 
 const TICK_MS = 1000
+// The engine's ledger is read again this often, so a figure the engine settled without a
+// measurement (a restored session, a compaction's own request) shows within seconds.
+const USAGE_READ_EVERY_TICKS = 5
 const TAIL_BYTES = 1024 * 1024
 const RING_PX = 16
 const RING_STROKE = 2.5
@@ -68,20 +71,55 @@ const FIND_TRANSCRIPT =
 // session.start, so the first event after one starts them.
 let isRunning = false
 
-// On Vertex, Bedrock or Foundry there is no plan, so no 5h or 7d window to ask for or draw.
-let isCloud = false
-// Claude Code asks for the hour on Vertex, Bedrock and Foundry unless this forces five minutes.
-let isForced5m = false
+// On Vertex, Bedrock or Foundry there is no plan, so no 5h or 7d window to ask for or draw; null
+// until the environment has been read, and nothing of the plan is drawn or asked for until then.
+let isCloud: boolean | null = null
+// The cache lifetime an environment variable pins; these outrank every setting, as the engine
+// reads them. Without one the lifetime waits for the first response that wrote the cache.
+let pinnedTtl: Ttl | null = null
 
-async function learnCloud($: EngineInterface): Promise<void> {
+async function learnEnv($: EngineInterface): Promise<void> {
   const flags = [
     await $.env.get('CLAUDE_CODE_USE_VERTEX'),
     await $.env.get('CLAUDE_CODE_USE_BEDROCK'),
     await $.env.get('CLAUDE_CODE_USE_FOUNDRY'),
   ]
   const on = (v: string | undefined) => v !== undefined && v !== '' && v !== '0' && v.toLowerCase() !== 'false'
+  const ttl = await $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL')
+  pinnedTtl = on(await $.env.get('FORCE_PROMPT_CACHING_5M')) ? '5m' : ttl === '5m' || ttl === '1h' ? ttl : null
   isCloud = flags.some(on)
-  isForced5m = on(await $.env.get('FORCE_PROMPT_CACHING_5M'))
+}
+
+// A debug log, off unless the folder `frontier-pacer-debug` exists in the Claude configuration
+// directory: then each session writes there what the band drew and the figures it drew it from,
+// one JSON line each (numbers and event names only), the newest 500 lines per session.
+let debugDir: string | null = null
+const debugLines: string[] = []
+let lastDrawn = ''
+
+async function learnDebug($: EngineInterface): Promise<void> {
+  try {
+    const config = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${(await $.env.get('HOME')) ?? ''}/.claude`
+    const dir = `${config}/frontier-pacer-debug`
+    debugDir = (await $.fs.stat(dir)).kind === 'dir' ? dir : null
+  } catch {
+    debugDir = null
+  }
+}
+
+async function debug($: EngineInterface, event: string, data: Record<string, unknown> = {}): Promise<void> {
+  if (debugDir === null) {
+    return
+  }
+  try {
+    const at = await $.clock.now()
+    const id = await $.session.id()
+    debugLines.push(JSON.stringify({ at: new Date(at).toISOString(), session: id, event, ...data }))
+    debugLines.splice(0, Math.max(0, debugLines.length - 500))
+    await $.fs.write(`${debugDir}/${id}.jsonl`, `${debugLines.join('\n')}\n`)
+  } catch {
+    // Nothing to log to.
+  }
 }
 
 function run($: EngineInterface): void {
@@ -91,7 +129,16 @@ function run($: EngineInterface): void {
 
   isRunning = true
   $.clock.after(1, () => void boot($))
-  $.clock.every(TICK_MS, () => void pulse($))
+  let ticks = 0
+  $.clock.every(TICK_MS, () => {
+    ticks += 1
+    void pulse($)
+    if (ticks % USAGE_READ_EVERY_TICKS === 0) {
+      void readLedger($)
+      // The response that says the lifetime can reach the transcript a moment after its turn ends.
+      void read($, cache).then(mark => (mark !== null && mark.ttl === null ? learnTtl($, false) : undefined))
+    }
+  })
   $.clock.every(USAGE_EVERY_MS, () => void fetchUsage($))
   $.clock.every(SHARED_EVERY_MS, () => void adoptShared($))
 }
@@ -108,8 +155,9 @@ export const register: Register = on => {
     run($)
     const m = toMeter(e.context, e.rateLimits, e.cost?.usd)
     await update($, meter, () => m)
+    void debug($, 'measure', { changed: e.changed, usd: m.usd, tokens: m.tokens })
     // A response landed (it cost something, or moved a window): its headers are the newest reading.
-    if (!isCloud && (e.changed.includes('cost') || e.changed.includes('rateLimits'))) {
+    if (isCloud === false && (e.changed.includes('cost') || e.changed.includes('rateLimits'))) {
       const at = await $.clock.now()
       await share($, m.limits.map(limit => ({ ...limit, at, source: 'headers' as const })))
       void fetchUsage($)
@@ -118,11 +166,13 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // A prompt starts the model working; the turn's end adds it to the total.
+  // A main-thread turn starts counting live; its end adds the engine's own length of it.
   on('turn.start', async ($, e, next) => {
     run($)
-    const at = await $.clock.now()
-    await update($, active, a => ({ ...(a ?? EMPTY_ACTIVE), since: at }))
+    if (e.agentId === undefined) {
+      const at = await $.clock.now()
+      await update($, active, a => ({ ...(a ?? freshActive(at)), since: at }))
+    }
 
     return next(e)
   })
@@ -135,22 +185,47 @@ export const register: Register = on => {
       await update($, model, () => e.model)
     }
 
-    return yield* next(e)
+    const response = yield* next(e)
+    // Until a response has said which lifetime the session's writes use, each one is read for it.
+    if (e.agentId === undefined && (await read($, cache))?.ttl == null) {
+      void learnTtl($, false)
+    }
+
+    return response
   })
 
   // The response records which lifetime its cache write used.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId === undefined) {
+      const at = await $.clock.now()
       // The engine's own length of the turn, to the millisecond, as its "Cogitated for" line reads.
+      // A turn already running when this load began was read from the transcript up to that moment,
+      // so only its part since then is added.
       await update($, active, a => {
-        const base = a ?? EMPTY_ACTIVE
-        const doneMs = baseOf(base) + e.durationMs
+        const held = a ?? freshActive(at)
+        const counted = held.since !== null ? e.durationMs : Math.min(e.durationMs, Math.max(0, at - held.loadedAt))
 
-        return { ...base, doneMs, closedMs: doneMs, lastPromptAt: null, since: null }
+        return { ...held, runMs: held.runMs + counted, since: null }
       })
+      void debug($, 'turn.complete', { durationMs: e.durationMs, reason: e.reason })
+      await saveActive($)
       await learnTtl($, false)
       void fetchUsage($)
+    }
+
+    return done
+  })
+
+  // A compaction's own request reads the main thread's cached prefix too. Afterwards the
+  // conversation is shorter, and the next request writes what it no longer shares.
+  on('session.compact', async ($, e, next) => {
+    const at = await $.clock.now()
+    const done = await next(e)
+    if (e.agentId === undefined && done.skip === undefined && done.usage !== undefined) {
+      await update($, cache, mark => (mark === null ? { at, ttl: null } : { ...mark, at: Math.max(mark.at, at) }))
+      void debug($, 'compact', { trigger: e.trigger, tokensAfter: done.tokensAfter ?? null })
+      void readLedger($)
     }
 
     return done
@@ -163,17 +238,26 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // /clear starts a new session in the same process, and /resume takes up another: the figures
+  // that belong to one session start over, then the new one's are read.
   on('session.end', async ($, e, next) => {
-    if (e.reason === 'clear') {
+    const isSwitch = e.reason === 'clear' || e.reason === 'resume'
+    if (isSwitch) {
       await update($, cache, () => null)
       await update($, transcript, () => null)
       await update($, meter, m => (m === null ? m : { ...m, tokens: null }))
-      // /clear starts the panel's count over, in the same process.
       const at = await $.clock.now()
-      await update($, active, () => ({ ...EMPTY_ACTIVE, from: at }))
+      // A cleared session has no turns yet; a resumed one has its own, read below.
+      await update($, active, () => (e.reason === 'clear' ? { ...freshActive(at), baseMs: 0, hasHistory: true } : freshActive(at)))
     }
 
-    return next(e)
+    const ended = await next(e)
+    void debug($, 'session.end', { reason: e.reason })
+    if (isSwitch) {
+      $.clock.after(1, () => void relearn($, e.reason === 'resume'))
+    }
+
+    return ended
   })
 
   // /pace hides the band or brings it back; /pace on and /pace off set it.
@@ -228,7 +312,7 @@ export const register: Register = on => {
       const text = usdText(m.usd)
       items.push({ key: 'cost', rank: 6, columns: text.length, node: <Text key="cost" bold>{text}</Text> })
     }
-    const activeMs = activeOf(worked, e.props.isWorking, now)
+    const activeMs = activeOf(worked, now)
     if (activeMs !== null) {
       const text = durationText(activeMs)
       items.push({ key: 'active', rank: 7, columns: 7 + text.length, node: (
@@ -239,10 +323,11 @@ export const register: Register = on => {
       ) })
     }
 
-    const ttl = mark === null ? null : (mark.ttl ?? guessTtl(m))
-    // While Claude works each request reads the cache again, so the timer holds full until the turn ends.
-    const remaining =
-      mark === null || ttl === null ? null : e.props.isWorking ? TTL_MS[ttl] : mark.at + TTL_MS[ttl] - now
+    // The lifetime left since the last main-thread request read the cache. Each request starts it
+    // over, so while Claude works it stays near full, and a long tool run or compaction counts down
+    // as the cache really ages. Until the lifetime is known it is not drawn rather than guessed.
+    const ttl = mark === null ? null : (mark.ttl ?? pinnedTtl)
+    const remaining = mark === null || ttl === null ? null : Math.min(TTL_MS[ttl], mark.at + TTL_MS[ttl] - now)
     if (ttl !== null && remaining !== null) {
       // The last tenth of the lifetime (6 minutes of the hour) is when a prompt still lands warm.
       const isLastTenth = remaining < TTL_MS[ttl] / 10
@@ -258,7 +343,7 @@ export const register: Register = on => {
     }
 
     // The newest reading of each window; until any, the headers the engine held at load.
-    const limits = isCloud ? [] : (held.length > 0 ? held : (m?.limits ?? [])).map(limit => current(limit, now))
+    const limits = isCloud !== false ? [] : (held.length > 0 ? held : (m?.limits ?? [])).map(limit => current(limit, now))
     for (const limit of limits) {
       const lane = laneOf(limit.kind)
       // A week scoped to one model shows while the session runs that model.
@@ -297,6 +382,13 @@ export const register: Register = on => {
       }
     }
 
+    if (debugDir !== null) {
+      const drawn = JSON.stringify({ usd: m?.usd ?? null, tokens: m?.tokens ?? null, active: activeMs === null ? null : Math.floor(activeMs / 60_000), ttl, cacheMinutes: remaining === null ? null : Math.ceil(remaining / 60_000), isWorking: e.props.isWorking, shown: fit(items, e.props.bodyColumns).map(item => item.key) })
+      if (drawn !== lastDrawn) {
+        lastDrawn = drawn
+        void debug($, 'drawn', JSON.parse(drawn) as Record<string, unknown>)
+      }
+    }
     if (items.length === 0) {
       return next(e)
     }
@@ -339,124 +431,245 @@ async function pulse($: EngineInterface): Promise<void> {
 }
 
 async function boot($: EngineInterface): Promise<void> {
-  await learnCloud($)
+  await learnEnv($)
+  await learnDebug($)
   try {
     await $.command.register({ name: COMMAND, description: 'Hide or show the usage band (on, off)', argumentHint: '[on|off]', immediate: true })
   } catch {
     // A host without slash commands: the band always shows.
   }
-  const usage = await $.session.usage()
-  await update($, meter, () => toMeter(usage.context, usage.rateLimits, usage.cost?.usd))
-  await learnTtl($, true)
-  await learnActive($)
+  await relearn($, true)
   await learnModel($)
   await fetchUsage($)
+  void forgetOldTotals($)
 }
 
-const PROMPT_SLACK_MS = 5_000
-const EMPTY_ACTIVE: Active = { doneMs: 0, closedMs: 0, lastPromptAt: null, since: null, from: null }
+// Reads what belongs to the session the process now runs: the ledger, the cache's last read and
+// lifetime from the transcript, and the time already worked.
+async function relearn($: EngineInterface, isSeeded: boolean): Promise<void> {
+  try {
+    const usage = await $.session.usage()
+    await update($, meter, () => toMeter(usage.context, usage.rateLimits, usage.cost?.usd))
+    void debug($, 'load', { usd: usage.cost?.usd ?? null, tokens: usage.context.tokens ?? null, isCloud, pinnedTtl })
+  } catch {
+    // The next measurement fills it.
+  }
+  await learnTtl($, isSeeded)
+  await learnActive($)
+}
 
-// Prints each main-thread turn of the transcript as `P <time>` for the prompt the person sent and
-// `A <time>` for the last row of the model's work after it (a response, a tool result); the rest of
-// each row is dropped, so a long transcript prints two short lines a turn.
+// The engine's ledger as /cost totals it. A measurement comes after each main-thread turn; this
+// catches what moved without one, so the figure never sits on a stale value for long.
+async function readLedger($: EngineInterface): Promise<void> {
+  try {
+    const usage = await $.session.usage()
+    const usd = usage.cost?.usd
+    if (usd === undefined) {
+      return
+    }
+    if ((await read($, meter))?.usd !== usd) {
+      void debug($, 'ledger', { usd, tokens: usage.context.tokens ?? null })
+    }
+    await update($, meter, m =>
+      m === null ? toMeter(usage.context, usage.rateLimits, usd) : m.usd === usd && m.tokens !== null ? m : { ...m, usd, tokens: m.tokens ?? usage.context.tokens ?? null },
+    )
+  } catch {
+    // No session bound yet: the next read or measurement fills it.
+  }
+}
+
+const ACTIVE_KEY = 'active:'
+// A session's total is dropped from the store once nobody has run it for this long.
+const ACTIVE_KEEP_MS = 90 * 24 * 60 * 60_000
+// Inside a turn whose end the transcript does not record (a turn cut short, an event that started
+// one without a prompt), a pause this long with no tool running ends it.
+const IDLE_GAP_MS = 30 * 60_000
+// Reading a transcript of hundreds of megabytes takes awk half a minute; it is done once a session.
+const HISTORY_TIMEOUT_MS = 5 * 60_000
+
+function freshActive(at: number): Active {
+  return { sessionId: null, baseMs: null, hasHistory: false, runMs: 0, since: null, loadedAt: at }
+}
+
+// Prints the main thread's transcript as rows of kind and time: `U` a prompt or event that can
+// start a turn, `T` a response that called a tool, `E` a response that ended the turn, `W` other
+// work (a tool's result, a summary). Of the `T` and `W` rows only the last of each minute prints,
+// so a long session prints a few hundred kilobytes at most. A row repeated in the file (same uuid)
+// counts once, and the engine's own stand-in replies (model `<synthetic>`, written when it closes a
+// turn, at times days later) are left out.
 const TURN_ROWS = `
-function flush() { if (work != "") print "A " work; work = "" }
+function flush() { if (held != "") print held; held = "" }
 /"isSidechain":true/ { next }
 {
   if (!match($0, /"timestamp":"[^"]*"/)) next
   ts = substr($0, RSTART + 13, RLENGTH - 14)
-  if ($0 ~ /"role":"assistant"/) { work = ts; next }
-  if ($0 ~ /"role":"user"/) {
-    if ($0 ~ /"tool_result"/) { work = ts; next }
-    if ($0 ~ /"isMeta":true/ || $0 ~ /"isCompactSummary":true/) next
-    flush()
-    print "P " ts
+  if (match($0, /"uuid":"[^"]*"/)) {
+    id = substr($0, RSTART + 8, RLENGTH - 9)
+    if (id in seen) next
+    seen[id] = 1
   }
+  kind = ""
+  if ($0 ~ /"type":"assistant"/ && $0 ~ /"role":"assistant"/) {
+    if ($0 ~ /"model":"<synthetic>"/) next
+    if ($0 ~ /"stop_reason":"tool_use"/) kind = "T"
+    else if ($0 ~ /"stop_reason":"(end_turn|stop_sequence|max_tokens|refusal)"/) kind = "E"
+    else kind = "W"
+  } else if ($0 ~ /"type":"user"/ && $0 ~ /"role":"user"/) {
+    if ($0 ~ /"tool_result"/ || $0 ~ /"isCompactSummary":true/) kind = "W"
+    else kind = "U"
+  }
+  if (kind == "") next
+  if (kind == "U" || kind == "E") { flush(); print kind " " ts; minute = ""; next }
+  if (substr(ts, 1, 16) != minute) flush()
+  held = kind " " ts
+  minute = substr(ts, 1, 16)
 }
 END { flush() }`
 
-// Reads every turn the transcript holds: each runs from a prompt to the last row of work before
-// the next prompt, so turns from before this plugin loaded (a resume, a reload) count too.
+// The time worked before this load: the session's stored total when one is kept, otherwise (its
+// first load with this version) the turns the transcript holds, which is then stored.
 async function learnActive($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
   try {
-    const path = await transcriptPath($)
-    if (path === null) {
-      await update($, active, a => a ?? EMPTY_ACTIVE)
-
+    const id = await $.session.id()
+    const held = await read($, active)
+    // A reload of this module keeps the figures it already has for the session.
+    if (held !== null && held.sessionId === id && held.baseMs !== null) {
       return
     }
 
-    // Every turn of the session counts, including those run by an earlier process: the app pauses
-    // idle sessions and starts a new process on the next prompt. Only /clear starts the count over.
-    const from = (await read($, active))?.from ?? null
-    const { stdout } = await $.process.run(['awk', TURN_ROWS, path])
-    const turns = turnsOf(stdout).filter(t => from === null || t.at >= from)
-    const doneMs = turns.reduce((sum, t) => sum + t.ms, 0)
-    const last = turns[turns.length - 1]
-    await update($, active, a => ({
-      doneMs,
-      closedMs: doneMs - (last?.ms ?? 0),
-      lastPromptAt: last?.at ?? null,
-      since: a?.since ?? null,
-      from,
-    }))
+    // /clear has already said its new session starts at nothing.
+    const carried = held !== null && held.sessionId === null ? held.baseMs : null
+    const loadedAt = held?.loadedAt ?? now
+    const base = carried ?? (await storedActive($, id)) ?? (await transcriptActive($, loadedAt))
+    await update($, active, a => {
+      const current = a ?? freshActive(loadedAt)
+      // Figures held for another session never carry over.
+      const own = current.sessionId === null || current.sessionId === id ? current : freshActive(now)
+
+      return { ...own, sessionId: id, baseMs: base ?? 0, hasHistory: base !== null }
+    })
+    await saveActive($)
   } catch {
-    await update($, active, a => a ?? EMPTY_ACTIVE)
+    await update($, active, a => (a === null ? { ...freshActive(now), baseMs: 0 } : a.baseMs === null ? { ...a, baseMs: 0 } : a))
   }
 }
 
-function turnsOf(rows: string): Array<{ at: number; ms: number }> {
-  const turns: Array<{ at: number; ms: number }> = []
-  let prompt: number | null = null
-  let last: number | null = null
-  const close = () => {
-    if (prompt !== null && last !== null && last > prompt) {
-      turns.push({ at: prompt, ms: last - prompt })
+async function storedActive($: EngineInterface, id: string): Promise<number | null> {
+  try {
+    const value = (await $.store.get(`${ACTIVE_KEY}${id}`)) as StoredActive | undefined
+
+    return value != null && typeof value.ms === 'number' && Number.isFinite(value.ms) && value.ms >= 0 ? value.ms : null
+  } catch {
+    return null
+  }
+}
+
+// The transcript's turns; null where it could not be read whole, so nothing partial is stored.
+async function transcriptActive($: EngineInterface, until: number): Promise<number | null> {
+  try {
+    const path = await transcriptPath($)
+    if (path === null) {
+      return 0
     }
+    const result = await $.process.run(['awk', TURN_ROWS, path], { timeoutMs: HISTORY_TIMEOUT_MS })
+    if (result.exitCode !== 0 || result.isStdoutTruncated) {
+      return null
+    }
+
+    return workedMs(result.stdout, until)
+  } catch {
+    return null
+  }
+}
+
+// Writes the session's total where every later process of it reads it.
+async function saveActive($: EngineInterface): Promise<void> {
+  try {
+    const worked = await read($, active)
+    if (worked === null || worked.baseMs === null || !worked.hasHistory) {
+      return
+    }
+    const id = worked.sessionId ?? (await $.session.id())
+    if (worked.sessionId === null) {
+      await update($, active, a => (a === null ? a : { ...a, sessionId: id }))
+    }
+    const value: StoredActive = { ms: worked.baseMs + worked.runMs, at: await $.clock.now() }
+    await $.store.set(`${ACTIVE_KEY}${id}`, value)
+  } catch {
+    // No store (a headless host): the figure lasts as long as the process.
+  }
+}
+
+async function forgetOldTotals($: EngineInterface): Promise<void> {
+  try {
+    const now = await $.clock.now()
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith(ACTIVE_KEY)) {
+        continue
+      }
+      const value = (await $.store.get(key)) as StoredActive | undefined
+      if (value == null || typeof value.at !== 'number' || now - value.at > ACTIVE_KEEP_MS) {
+        await $.store.delete(key)
+      }
+    }
+  } catch {
+    // Kept until the next start.
+  }
+}
+
+// Sums the main thread's turns from TURN_ROWS' lines, up to `until`. A turn runs from the row that
+// opens it to the response that ends it; a pause longer than IDLE_GAP_MS while no tool runs ends a
+// turn the transcript never closed, so idle hours are never counted as work. A turn still running
+// at `until` counts to its last row; its end adds the rest (see turn.complete).
+function workedMs(rows: string, until: number): number {
+  let total = 0
+  let start: number | null = null
+  let last = 0
+  let isToolRunning = false
+  const close = () => {
+    if (start !== null) {
+      total += Math.max(0, Math.min(last, until) - start)
+    }
+    start = null
+    isToolRunning = false
   }
   for (const row of rows.split('\n')) {
+    const kind = row.slice(0, 1)
     const at = Date.parse(row.slice(2))
-    if (Number.isNaN(at)) {
+    if (Number.isNaN(at) || !'UTEW'.includes(kind) || kind === '' || at >= until) {
       continue
     }
-    if (row.startsWith('P ')) {
+    if (start !== null && at > last + IDLE_GAP_MS && !isToolRunning) {
       close()
-      prompt = at
-      last = null
-    } else if (prompt !== null) {
+    }
+    if (start === null) {
+      if (kind === 'E') {
+        continue
+      }
+      start = at
       last = at
+    } else {
+      last = Math.max(last, at)
+    }
+    isToolRunning = kind === 'T'
+    if (kind === 'E') {
+      close()
     }
   }
   close()
 
-  return turns
+  return total
 }
 
-// While a turn runs it counts from its start: the one this plugin saw begin, or else (loaded
-// mid-turn) the transcript's last prompt, whose partial length is then left out of the total.
-function activeOf(worked: Active | null, isWorking: boolean, now: number): number | null {
-  if (worked === null) {
+// The finished turns, and the running one from the moment its start was seen. Not drawn until the
+// session's earlier turns are read, so the figure never starts low and leaps.
+function activeOf(worked: Active | null, now: number): number | null {
+  if (worked === null || worked.baseMs === null) {
     return null
   }
-  if (!isWorking) {
-    return worked.doneMs
-  }
-  const start = worked.since ?? worked.lastPromptAt
 
-  return start === null ? worked.doneMs : baseOf(worked) + Math.max(0, now - start)
-}
-
-// The finished turns before the running one. A transcript read after the running turn began holds
-// part of it as its last turn; loaded mid-turn (no start seen), that last turn is the running one.
-function baseOf(worked: Active): number {
-  if (worked.lastPromptAt === null) {
-    return worked.doneMs
-  }
-  if (worked.since === null) {
-    return worked.closedMs
-  }
-
-  return worked.lastPromptAt >= worked.since - PROMPT_SLACK_MS ? worked.closedMs : worked.doneMs
+  return worked.baseMs + worked.runMs + (worked.since === null ? 0 : Math.max(0, now - worked.since))
 }
 
 async function learnModel($: EngineInterface): Promise<void> {
@@ -571,7 +784,7 @@ async function adoptShared($: EngineInterface): Promise<Shared> {
 // Reads the windows /usage shows: the session, the week across models, Sonnet's week, and each week
 // scoped to one model. A failure keeps the last readings, which the next response's headers refresh.
 async function fetchUsage($: EngineInterface): Promise<void> {
-  if (isCloud) {
+  if (isCloud !== false) {
     return
   }
   try {
@@ -766,18 +979,6 @@ function ttlOf(usage: unknown): Ttl | null {
   }
 
   return null
-}
-
-// Before any response says: subscribers get the hour unless they are past a limit, everyone else five minutes.
-function guessTtl(m: Meter | null): Ttl {
-  if (isCloud) {
-    return isForced5m ? '5m' : '1h'
-  }
-  if (m === null || m.limits.length === 0) {
-    return '5m'
-  }
-
-  return m.limits.some(l => l.percentUsed >= 100) ? '5m' : '1h'
 }
 
 type Stage = 'onTrack' | 'slightlyAhead' | 'ahead' | 'farAhead' | 'slightlyBehind' | 'behind' | 'farBehind'
